@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import logging
-import re
-from configparser import ConfigParser
-from pathlib import Path
+from collections import Counter
 from random import shuffle
+from shutil import rmtree
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
-    FrozenSet,
-    Iterable,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
 )
 
-from aiohttp import ClientSession, ClientTimeout, DummyCookieJar
+import aiofiles
+import aiofiles.os
+import aiofiles.ospath
+import attrs
+import maxminddb
+from aiohttp import ClientResponse, ClientSession, ClientTimeout, hdrs
 from aiohttp_socks import ProxyType
 from rich.console import Console
 from rich.progress import (
@@ -29,222 +35,120 @@ from rich.progress import (
     TextColumn,
 )
 from rich.table import Table
-from typing_extensions import Self
 
-from . import sort, validators
-from .constants import DEFAULT_CHECK_WEBSITE, HEADERS
-from .folder import Folder
-from .null_context import AsyncNullContext
+from . import sort
+from .constants import CACHE_DIR, GEODB_ETAG_PATH, GEODB_PATH, GEODB_URL
+from .null_context import NullContext
+from .parsers import PROXY_REGEX
 from .proxy import Proxy
+from .settings import Settings
+from .utils import bytes_decode, is_url
+
+if TYPE_CHECKING:
+    from _typeshed import SupportsRichComparison
 
 logger = logging.getLogger(__name__)
 
 
-class ProxyScraperChecker:
-    """HTTP, SOCKS4, SOCKS5 proxies scraper and checker."""
+async def read_etag() -> Optional[str]:
+    try:
+        async with aiofiles.open(GEODB_ETAG_PATH, "rb") as etag_file:
+            content = await etag_file.read()
+    except FileNotFoundError:
+        return None
+    return bytes_decode(content)
 
-    __slots__ = (
-        "check_website",
-        "console",
-        "cookie_jar",
-        "folders",
-        "geolocation_enabled",
-        "path",
-        "proxies_count",
-        "proxies",
-        "regex",
-        "sem",
-        "sort_by_speed",
-        "source_timeout",
-        "sources",
-        "timeout",
+
+async def save_etag(etag: Optional[str]) -> None:
+    if etag:
+        async with aiofiles.open(
+            GEODB_ETAG_PATH, "w", encoding="utf-8"
+        ) as etag_file:
+            await etag_file.write(etag)
+
+
+async def save_geodb(
+    r: ClientResponse, *, progress: Progress, task: TaskID
+) -> None:
+    async with aiofiles.open(GEODB_PATH, "wb") as geodb:
+        async for chunk in r.content.iter_any():
+            await geodb.write(chunk)
+            progress.update(task, advance=len(chunk))
+
+
+async def download_geodb(session: ClientSession, progress: Progress) -> None:
+    headers = None
+    if await aiofiles.ospath.exists(GEODB_PATH):
+        current_etag = await read_etag()
+        if current_etag:
+            headers = {hdrs.IF_NONE_MATCH: current_etag}
+
+    async with session.get(
+        GEODB_URL, headers=headers, raise_for_status=True
+    ) as r:
+        if r.status == 304:  # noqa: PLR2004
+            logger.info(
+                "Latest geolocation database is already cached at %s",
+                GEODB_PATH,
+            )
+            return
+        await save_geodb(
+            r,
+            progress=progress,
+            task=progress.add_task(
+                "[yellow]Downloader[red] :: [green]GeoDB",
+                total=r.content_length,
+            ),
+        )
+    await save_etag(r.headers.get(hdrs.ETAG))
+
+
+def create_proxy_list_str(
+    *, include_protocol: bool, proxies: Sequence[Proxy], anonymous_only: bool
+) -> str:
+    return "\n".join(
+        proxy.as_str(include_protocol=include_protocol)
+        for proxy in proxies
+        if not anonymous_only or proxy.host != proxy.exit_ip
     )
 
-    def __init__(
-        self,
-        *,
-        timeout: float,
-        source_timeout: float,
-        max_connections: int,
-        check_website: str,
-        sort_by_speed: bool,
-        save_path: Path,
-        folders: Iterable[Folder],
-        sources: Dict[ProxyType, Optional[str]],
-        console: Optional[Console] = None,
-    ) -> None:
-        """HTTP, SOCKS4, SOCKS5 proxies scraper and checker.
 
-        Args:
-            timeout: The number of seconds to wait for a proxied request.
-                The higher the number, the longer the check will take and the
-                more proxies you get.
-            source_timeout: The number of seconds to wait for the proxies to be
-                downloaded from the source.
-            max_connections: Maximum concurrent connections.
-                Windows supports maximum of 512.
-                On *nix operating systems, this restriction is much looser.
-                The limit on *nix can be seen with the command `ulimit -Hn`.
-                Don't be in a hurry to set high values.
-                Make sure you have enough RAM first, gradually increasing the
-                default value.
-                If set to 0, the maximum value available for your OS will be
-                used.
-            check_website: URL to which to send a request to check the proxy.
-                If not equal to 'default', it will not be possible to determine
-                the anonymity and geolocation of the proxies.
-            sort_by_speed: Set to False to sort proxies alphabetically.
-            save_path: Path to the folder where the proxy folders will be
-                saved.
-                Leave empty to save the proxies to the current directory.
-        """
-        validators.timeout(timeout)
-        self.timeout = ClientTimeout(total=timeout, sock_connect=float("inf"))
-
-        validators.source_timeout(source_timeout)
-        self.source_timeout = source_timeout
-
-        max_conn = validators.max_connections(max_connections)
-        self.sem: Union[asyncio.Semaphore, AsyncNullContext] = (
-            asyncio.Semaphore(max_conn) if max_conn else AsyncNullContext()
-        )
-
-        self.check_website = check_website
-        self.sort_by_speed = sort_by_speed
-        self.path = save_path
-        self.folders = folders
-
-        if self.check_website == "default":
-            self.check_website = DEFAULT_CHECK_WEBSITE
-
-        if self.check_website == DEFAULT_CHECK_WEBSITE:
-            validators.folders(self.folders)
-        else:
-            validators.check_website(check_website)
-            logger.info(
-                "CheckWebsite is not 'default', "
-                "so it will not be possible to determine "
-                "the anonymity and geolocation of the proxies"
-            )
-            for folder in self.folders:
-                folder.is_enabled = (
-                    not folder.for_anonymous and not folder.for_geolocation
-                )
-
-        self.geolocation_enabled = any(
-            self.check_website == DEFAULT_CHECK_WEBSITE
-            and folder.is_enabled
-            and folder.for_geolocation
-            for folder in self.folders
-        )
-
-        self.sources: Dict[ProxyType, FrozenSet[str]] = {
-            proto: frozenset(filter(None, sources.splitlines()))
-            for proto, sources in sources.items()
-            if sources
-        }
-        validators.sources(self.sources)
-        self.proxies: Dict[ProxyType, Set[Proxy]] = {
-            proto: set() for proto in self.sources
-        }
-
-        self.console = console or Console()
-        self.cookie_jar = DummyCookieJar()
-        self.regex = re.compile(
-            r"(?:^|\D)?("
-            r"(?:[1-9]|[1-9]\d|1\d{2}|2[0-4]\d|25[0-5])"  # 1-255
-            + r"\.(?:\d|[1-9]\d|1\d{2}|2[0-4]\d|25[0-5])" * 3  # 0-255
-            + r"):"
-            + (
-                r"(\d|[1-9]\d{1,3}|[1-5]\d{4}|6[0-4]\d{3}"
-                r"|65[0-4]\d{2}|655[0-2]\d|6553[0-5])"
-            )  # 0-65535
-            + r"(?:\D|$)"
-        )
-
-    @classmethod
-    def from_configparser(
-        cls, cfg: ConfigParser, *, console: Optional[Console] = None
-    ) -> Self:
-        general = cfg["General"]
-        folders = cfg["Folders"]
-        http = cfg["HTTP"]
-        socks4 = cfg["SOCKS4"]
-        socks5 = cfg["SOCKS5"]
-        save_path = Path(general.get("SavePath", ""))
-        return cls(
-            timeout=general.getfloat("Timeout", 5),
-            source_timeout=general.getfloat("SourceTimeout", 15),
-            max_connections=general.getint("MaxConnections", 512),
-            check_website=general.get("CheckWebsite", "default"),
-            sort_by_speed=general.getboolean("SortBySpeed", True),
-            save_path=save_path,
-            folders=(
-                Folder(
-                    path=save_path / "proxies",
-                    is_enabled=folders.getboolean("proxies", True),
-                    for_anonymous=False,
-                    for_geolocation=False,
-                ),
-                Folder(
-                    path=save_path / "proxies_anonymous",
-                    is_enabled=folders.getboolean("proxies_anonymous", True),
-                    for_anonymous=True,
-                    for_geolocation=False,
-                ),
-                Folder(
-                    path=save_path / "proxies_geolocation",
-                    is_enabled=folders.getboolean("proxies_geolocation", True),
-                    for_anonymous=False,
-                    for_geolocation=True,
-                ),
-                Folder(
-                    path=save_path / "proxies_geolocation_anonymous",
-                    is_enabled=folders.getboolean(
-                        "proxies_geolocation_anonymous", True
-                    ),
-                    for_anonymous=True,
-                    for_geolocation=True,
-                ),
-            ),
-            sources={
-                ProxyType.HTTP: (
-                    http.get("Sources")
-                    if http.getboolean("Enabled", True)
-                    else None
-                ),
-                ProxyType.SOCKS4: (
-                    socks4.get("Sources")
-                    if socks4.getboolean("Enabled", True)
-                    else None
-                ),
-                ProxyType.SOCKS5: (
-                    socks5.get("Sources")
-                    if socks5.getboolean("Enabled", True)
-                    else None
-                ),
-            },
-            console=console,
-        )
+@attrs.define(
+    repr=False,
+    weakref_slot=False,
+    kw_only=True,
+    eq=False,
+    getstate_setstate=False,
+    match_args=False,
+)
+class ProxyScraperChecker:
+    console: Console
+    proxies_count: Dict[ProxyType, int] = attrs.field(init=False, factory=dict)
+    proxies: Set[Proxy] = attrs.field(init=False, factory=set)
+    session: ClientSession
+    settings: Settings
 
     async def fetch_source(
         self,
         *,
-        session: ClientSession,
         source: str,
         proto: ProxyType,
         progress: Progress,
         task: TaskID,
+        timeout: ClientTimeout,
     ) -> None:
-        """Get proxies from source.
-
-        Args:
-            source: Proxy list URL.
-        """
         try:
-            async with session.get(source) as response:
-                await response.read()
-            text = await response.text()
+            if is_url(source):
+                async with self.session.get(
+                    source, timeout=timeout
+                ) as response:
+                    await response.read()
+                text = await response.text()
+            else:
+                response = None
+                async with aiofiles.open(source, "rb") as f:
+                    content = await f.read()
+                text = bytes_decode(content)
         except asyncio.TimeoutError:
             logger.warning("%s | Timed out", source)
         except Exception as e:
@@ -267,49 +171,42 @@ class ProxyScraperChecker:
             )
             logger.error(*args)
         else:
-            proxies = self.regex.finditer(text)
+            proxies = PROXY_REGEX.finditer(text)
             try:
                 proxy = next(proxies)
             except StopIteration:
                 args = (
                     ("%s | No proxies found", source)
-                    if response.status == 200  # noqa: PLR2004
+                    if not response or response.status == 200  # noqa: PLR2004
                     else ("%s | HTTP status code %d", source, response.status)
                 )
                 logger.warning(*args)
             else:
-                proxies_set = self.proxies[proto]
-                proxies_set.add(
-                    Proxy(host=proxy.group(1), port=int(proxy.group(2)))
-                )
-                for proxy in proxies:
-                    proxies_set.add(
-                        Proxy(host=proxy.group(1), port=int(proxy.group(2)))
+                for proxy in itertools.chain((proxy,), proxies):  # noqa: B020
+                    try:
+                        protocol = ProxyType[proxy.group("protocol").upper()]
+                    except (AttributeError, KeyError):
+                        protocol = proto
+                    self.proxies.add(
+                        Proxy(
+                            protocol=protocol,
+                            host=proxy.group("host"),
+                            port=int(proxy.group("port")),
+                            username=proxy.group("username"),
+                            password=proxy.group("password"),
+                        )
                     )
         progress.update(task, advance=1)
 
     async def check_proxy(
-        self,
-        *,
-        proxy: Proxy,
-        proto: ProxyType,
-        progress: Progress,
-        task: TaskID,
+        self, *, proxy: Proxy, progress: Progress, task: TaskID
     ) -> None:
-        """Check if proxy is alive."""
         try:
-            await proxy.check(
-                website=self.check_website,
-                sem=self.sem,
-                cookie_jar=self.cookie_jar,
-                proto=proto,
-                timeout=self.timeout,
-                set_geolocation=self.geolocation_enabled,
-            )
+            await proxy.check(self.settings)
         except Exception as e:
             # Too many open files
             if isinstance(e, OSError) and e.errno == 24:  # noqa: PLR2004
-                logger.error("Please, set MaxConnections to lower value.")
+                logger.error("Please, set max_connections to lower value.")
 
             logger.debug(
                 "%s.%s | %s",
@@ -317,7 +214,7 @@ class ProxyScraperChecker:
                 e.__class__.__qualname__,
                 e,
             )
-            self.proxies[proto].remove(proxy)
+            self.proxies.remove(proxy)
         progress.update(task, advance=1)
 
     async def fetch_all_sources(self, progress: Progress) -> None:
@@ -326,109 +223,152 @@ class ProxyScraperChecker:
                 f"[yellow]Scraper [red]:: [green]{proto.name}",
                 total=len(sources),
             )
-            for proto, sources in self.sources.items()
+            for proto, sources in self.settings.sources.items()
         }
-        async with ClientSession(
-            headers=HEADERS,
-            cookie_jar=self.cookie_jar,
-            timeout=ClientTimeout(total=self.source_timeout),
-        ) as session:
-            coroutines = (
-                self.fetch_source(
-                    session=session,
-                    source=source,
-                    proto=proto,
-                    progress=progress,
-                    task=tasks[proto],
-                )
-                for proto, sources in self.sources.items()
-                for source in sources
+        timeout = ClientTimeout(total=self.settings.source_timeout)
+        coroutines = (
+            self.fetch_source(
+                source=source,
+                proto=proto,
+                progress=progress,
+                task=tasks[proto],
+                timeout=timeout,
             )
-            await asyncio.gather(*coroutines)
-
-        self.proxies_count = {
-            proto: len(proxies) for proto, proxies in self.proxies.items()
-        }
+            for proto, sources in self.settings.sources.items()
+            for source in sources
+        )
+        await asyncio.gather(*coroutines)
+        self.proxies_count = self.get_current_proxies_count()
 
     async def check_all_proxies(self, progress: Progress) -> None:
         tasks = {
             proto: progress.add_task(
-                f"[yellow]Checker [red]:: [green]{proto.name}",
-                total=len(proxies),
+                f"[yellow]Checker [red]:: [green]{proto.name}", total=count
             )
-            for proto, proxies in self.proxies.items()
+            for proto, count in self.get_current_proxies_count().items()
         }
         coroutines = [
             self.check_proxy(
-                proxy=proxy, proto=proto, progress=progress, task=tasks[proto]
+                proxy=proxy, progress=progress, task=tasks[proxy.protocol]
             )
-            for proto, proxies in self.proxies.items()
-            for proxy in proxies
+            for proxy in self.proxies
         ]
         shuffle(coroutines)
         await asyncio.gather(*coroutines)
 
+    @aiofiles.ospath.wrap
     def save_proxies(self) -> None:
-        """Delete old proxies and save new ones."""
-        sorted_proxies = self.get_sorted_proxies().items()
-        for folder in self.folders:
-            folder.remove()
-        for folder in self.folders:
-            if not folder.is_enabled:
-                continue
-            folder.create()
-            for proto, proxies in sorted_proxies:
-                text = "\n".join(
-                    proxy.as_str(include_geolocation=folder.for_geolocation)
-                    for proxy in proxies
-                    if (proxy.is_anonymous if folder.for_anonymous else True)
+        sorted_proxies = self.get_sorted_proxies(
+            sort_key=self.settings.sorting_key
+        )
+        if self.settings.output_json:
+            mmdb: Union[maxminddb.Reader, NullContext] = (
+                maxminddb.open_database(GEODB_PATH)
+                if self.settings.enable_geolocation
+                else NullContext()
+            )
+            self.settings.output_path.mkdir(parents=True, exist_ok=True)
+            with mmdb as mmdb_reader:
+                proxy_dicts = [
+                    {
+                        "protocol": proxy.protocol.name.lower(),
+                        "username": proxy.username,
+                        "password": proxy.password,
+                        "host": proxy.host,
+                        "port": proxy.port,
+                        "exit_ip": proxy.exit_ip,
+                        "timeout": round(proxy.timeout, 2),
+                        "geolocation": mmdb_reader.get(proxy.exit_ip)
+                        if mmdb_reader is not None
+                        else None,
+                    }
+                    for proxy in sorted(self.proxies, key=sort.timeout_sort_key)
+                ]
+                with (self.settings.output_path / "proxies.json").open(
+                    "w", encoding="utf-8"
+                ) as f:
+                    json.dump(
+                        proxy_dicts,
+                        f,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                with (self.settings.output_path / "proxies_pretty.json").open(
+                    "w", encoding="utf-8"
+                ) as f:
+                    json.dump(proxy_dicts, f, ensure_ascii=False, indent="\t")
+
+        if self.settings.output_txt:
+            grouped_proxies = tuple(
+                (k, sorted(v, key=self.settings.sorting_key))
+                for k, v in self.get_grouped_proxies().items()
+            )
+
+            for folder, anonymous_only in (
+                (self.settings.output_path / "proxies", False),
+                (self.settings.output_path / "proxies_anonymous", True),
+            ):
+                try:
+                    rmtree(folder)
+                except FileNotFoundError:
+                    pass
+                folder.mkdir(parents=True, exist_ok=True)
+                text = create_proxy_list_str(
+                    proxies=sorted_proxies,
+                    anonymous_only=anonymous_only,
+                    include_protocol=True,
                 )
-                file = folder.path / f"{proto.name.lower()}.txt"
-                file.write_text(text, encoding="utf-8")
+                (folder / "all.txt").write_text(text, encoding="utf-8")
+                for proto, proxies in grouped_proxies:
+                    text = create_proxy_list_str(
+                        proxies=proxies,
+                        anonymous_only=anonymous_only,
+                        include_protocol=False,
+                    )
+                    (
+                        folder / f"{ProxyType(proto).name.lower()}.txt"
+                    ).write_text(text, encoding="utf-8")
         logger.info(
-            "Proxy folders have been created in the %s folder.",
-            self.path.resolve(),
+            "Proxies have been saved at %s.",
+            self.settings.output_path.absolute(),
         )
 
     async def run(self) -> None:
+        if self.settings.enable_geolocation:
+            await aiofiles.os.makedirs(CACHE_DIR, exist_ok=True)
         with self._get_progress_bar() as progress:
-            await self.fetch_all_sources(progress)
+            fetch = self.fetch_all_sources(progress)
+            if self.settings.enable_geolocation:
+                await asyncio.gather(
+                    fetch, download_geodb(self.session, progress)
+                )
+            else:
+                await fetch
             await self.check_all_proxies(progress)
 
         table = self._get_results_table()
         self.console.print(table)
 
-        self.save_proxies()
+        await self.save_proxies()
 
         logger.info(
             "Thank you for using "
             "https://github.com/monosans/proxy-scraper-checker :)"
         )
 
-    def get_sorted_proxies(self) -> Dict[ProxyType, List[Proxy]]:
-        key: Union[
-            Callable[[Proxy], float], Callable[[Proxy], Tuple[int, ...]]
-        ] = (
-            sort.timeout_sort_key
-            if self.sort_by_speed
-            else sort.natural_sort_key
-        )
-        return {
-            proto: sorted(proxies, key=key)
-            for proto, proxies in self.proxies.items()
-        }
-
     def _get_results_table(self) -> Table:
         table = Table()
         table.add_column("Protocol", style="cyan")
         table.add_column("Working", style="magenta")
         table.add_column("Total", style="green")
-        for proto, proxies in self.proxies.items():
-            working = len(proxies)
-            total = self.proxies_count[proto]
+        for proto, proxies in self.get_grouped_proxies().items():
+            working = len(tuple(proxies))
+            total = self.proxies_count[ProxyType(proto)]
             percentage = working / total if total else 0
             table.add_row(
-                proto.name, f"{working} ({percentage:.1%})", str(total)
+                ProxyType(proto).name,
+                f"{working} ({percentage:.1%})",
+                str(total),
             )
         return table
 
@@ -439,3 +379,26 @@ class ProxyScraperChecker:
             MofNCompleteColumn(),
             console=self.console,
         )
+
+    def get_grouped_proxies(self) -> Dict[ProxyType, Tuple[Proxy, ...]]:
+        key = sort.protocol_sort_key
+        return {
+            **{proto: () for proto in self.settings.sources},
+            **{
+                ProxyType(k): tuple(v)
+                for k, v in itertools.groupby(
+                    sorted(self.proxies, key=key), key=key
+                )
+            },
+        }
+
+    def get_sorted_proxies(
+        self,
+        sort_key: Callable[
+            [Proxy], SupportsRichComparison
+        ] = sort.protocol_sort_key,
+    ) -> List[Proxy]:
+        return sorted(self.proxies, key=sort_key)
+
+    def get_current_proxies_count(self) -> Dict[ProxyType, int]:
+        return dict(Counter(proxy.protocol for proxy in self.proxies))

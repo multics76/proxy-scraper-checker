@@ -3,13 +3,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from configparser import ConfigParser
+from typing import TYPE_CHECKING, Dict
 
+import aiofiles
 import rich.traceback
+from aiohttp import ClientSession, TCPConnector
 from rich.console import Console
 from rich.logging import RichHandler
 
+from . import constants, utils
 from .proxy_scraper_checker import ProxyScraperChecker
+from .settings import Settings
+from .typing_compat import Any
+
+if sys.version_info >= (3, 11):
+    try:
+        import tomllib
+    except ImportError:
+        # Help users on older alphas
+        if not TYPE_CHECKING:
+            import tomli as tomllib
+else:
+    import tomli as tomllib
 
 
 def set_event_loop_policy() -> None:
@@ -47,19 +62,26 @@ def configure_logging(console: Console, *, debug: bool) -> None:
     )
 
 
-def get_config(file: str) -> ConfigParser:
-    cfg = ConfigParser(interpolation=None)
-    cfg.read(file, encoding="utf-8")
-    return cfg
+async def read_config(file: str) -> Dict[str, Any]:
+    async with aiofiles.open(file, "rb") as f:
+        content = await f.read()
+    return tomllib.loads(utils.bytes_decode(content))
 
 
 async def main() -> None:
-    cfg = get_config("config.ini")
-
+    cfg = await read_config("config.toml")
     console = Console()
-    configure_logging(console, debug=cfg["General"].getboolean("Debug", False))
+    configure_logging(console, debug=cfg["debug"])
 
-    await ProxyScraperChecker.from_configparser(cfg, console=console).run()
+    async with ClientSession(
+        connector=TCPConnector(ssl=constants.SSL_CONTEXT),
+        cookie_jar=constants.get_cookie_jar(),
+        fallback_charset_resolver=utils.fallback_charset_resolver,
+    ) as s:
+        settings = await Settings.from_dict(cfg, session=s)
+        await ProxyScraperChecker(
+            console=console, session=s, settings=settings
+        ).run()
 
 
 if __name__ == "__main__":
