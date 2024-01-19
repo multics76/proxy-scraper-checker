@@ -123,7 +123,7 @@ def create_proxy_list_str(
 )
 class ProxyScraperChecker:
     console: Console
-    proxies_count: Dict[ProxyType, int] = attrs.field(init=False, factory=dict)
+    proxies_count: Dict[ProxyType, int] = attrs.field(init=False)
     proxies: Set[Proxy] = attrs.field(init=False, factory=set)
     session: ClientSession
     settings: Settings
@@ -243,9 +243,11 @@ class ProxyScraperChecker:
     async def check_all_proxies(self, progress: Progress) -> None:
         tasks = {
             proto: progress.add_task(
-                f"[yellow]Checker [red]:: [green]{proto.name}", total=count
+                f"[yellow]Checker [red]:: [green]{proto.name}",
+                total=self.proxies_count[proto],
             )
-            for proto, count in self.get_current_proxies_count().items()
+            for proto in sort.PROTOCOL_ORDER
+            if proto in self.proxies_count
         }
         coroutines = [
             self.check_proxy(
@@ -319,15 +321,15 @@ class ProxyScraperChecker:
                     include_protocol=True,
                 )
                 (folder / "all.txt").write_text(text, encoding="utf-8")
-                for proto, proxies in grouped_proxies:
+                for (_, proto), proxies in grouped_proxies:
                     text = create_proxy_list_str(
                         proxies=proxies,
                         anonymous_only=anonymous_only,
                         include_protocol=False,
                     )
-                    (
-                        folder / f"{ProxyType(proto).name.lower()}.txt"
-                    ).write_text(text, encoding="utf-8")
+                    (folder / f"{proto.name.lower()}.txt").write_text(
+                        text, encoding="utf-8"
+                    )
         logger.info(
             "Proxies have been saved at %s.",
             self.settings.output_path.absolute(),
@@ -340,7 +342,7 @@ class ProxyScraperChecker:
             fetch = self.fetch_all_sources(progress)
             if self.settings.enable_geolocation:
                 await asyncio.gather(
-                    fetch, download_geodb(self.session, progress)
+                    download_geodb(self.session, progress), fetch
                 )
             else:
                 await fetch
@@ -361,14 +363,12 @@ class ProxyScraperChecker:
         table.add_column("Protocol", style="cyan")
         table.add_column("Working", style="magenta")
         table.add_column("Total", style="green")
-        for proto, proxies in self.get_grouped_proxies().items():
-            working = len(tuple(proxies))
-            total = self.proxies_count[ProxyType(proto)]
-            percentage = working / total if total else 0
+        current_count = self.get_current_proxies_count()
+        for proto, total in self.proxies_count.items():
+            working = current_count.get(proto, 0)
+            percentage = working / total
             table.add_row(
-                ProxyType(proto).name,
-                f"{working} ({percentage:.1%})",
-                str(total),
+                proto.name, f"{working} ({percentage:.1%})", str(total)
             )
         return table
 
@@ -382,15 +382,16 @@ class ProxyScraperChecker:
 
     def get_grouped_proxies(self) -> Dict[ProxyType, Tuple[Proxy, ...]]:
         key = sort.protocol_sort_key
-        return {
-            **{proto: () for proto in self.settings.sources},
-            **{
-                ProxyType(k): tuple(v)
-                for k, v in itertools.groupby(
-                    sorted(self.proxies, key=key), key=key
-                )
-            },
+        d: Dict[ProxyType, Tuple[Proxy, ...]] = {
+            proto: ()
+            for proto in sort.PROTOCOL_ORDER
+            if proto in self.proxies_count
         }
+        for (_, proto), v in itertools.groupby(
+            sorted(self.proxies, key=key), key=key
+        ):
+            d[proto] = tuple(v)
+        return d
 
     def get_sorted_proxies(
         self,

@@ -22,7 +22,7 @@ You can get proxies obtained using this script in [monosans/proxy-list](https://
 
 This is the easiest way, but it is only available for x64 Windows, macOS and Linux. Just download the archive for your OS from <https://nightly.link/monosans/proxy-scraper-checker/workflows/ci/main?preview>, unzip it, edit `config.toml` and run the executable.
 
-If Windows Defender detects an executable file as a trojan, please read [this](https://github.com/Nuitka/Nuitka/issues/2495#issuecomment-1762836583).
+If Windows Defender detects an executable file as a virus, please read [this](https://github.com/Nuitka/Nuitka/issues/2495#issuecomment-1762836583).
 
 ### Running from source code
 

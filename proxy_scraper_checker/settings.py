@@ -196,7 +196,10 @@ class Settings:
                 attrs.validators.and_(
                     attrs.validators.min_len(1),
                     attrs.validators.deep_iterable(
-                        attrs.validators.instance_of(str)
+                        attrs.validators.and_(
+                            attrs.validators.instance_of(str),
+                            attrs.validators.min_len(1),
+                        )
                     ),
                 ),
             ),
