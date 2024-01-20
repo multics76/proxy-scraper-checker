@@ -16,7 +16,7 @@ repos:
         args:
           - --fix=lf
       - id: trailing-whitespace
-  - repo: https://github.com/monosans/pre-commit-prettier
+  - repo: https://github.com/multics76/pre-commit-prettier
     rev: v3.2.4
     hooks:
       - id: prettier
