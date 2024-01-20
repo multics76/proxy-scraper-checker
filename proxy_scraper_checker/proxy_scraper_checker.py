@@ -402,7 +402,7 @@ class ProxyScraperChecker:
 
         logger.info(
             "Thank you for using "
-            "https://github.com/monosans/proxy-scraper-checker :)"
+            "https://github.com/multics76/proxy-scraper-checker :)"
         )
 
     def get_sorted_proxies(self) -> Dict[ProxyType, List[Proxy]]:
